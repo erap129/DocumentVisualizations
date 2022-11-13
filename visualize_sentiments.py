@@ -28,6 +28,7 @@ from pynndescent import NNDescent
 from umap.umap_ import fuzzy_simplicial_set
 from sklearn.utils import check_random_state
 from umap.parametric_umap import construct_edge_dataset
+from umap.parametric_umap import umap_loss 
 
 
 def mean_pooling(model_output, attention_mask):
@@ -83,13 +84,39 @@ class E2ESentenceTransformer(tf.keras.Model):
         return self.model(tokenized)
 
 
+class UMAPExtender(tf.keras.Model):
+    def __init__(self, model):
+        super().__init__()
+        self.encoder = model
+        self.encoder.trainable = False
+        self.dense = tf.keras.layers.Dense(2)
+
+    def call(self, inputs):
+        (to_x, from_x) = inputs
+        # parametric embedding
+        embedding_to = self.encoder(to_x)
+        embedding_from = self.encoder(from_x)
+        viz_to = self.dense(embedding_to)
+        viz_from = self.dense(embedding_from)
+
+        # concatenate to/from projections for loss computation
+        viz_to_from = tf.concat([viz_to, viz_from], axis=1)
+        viz_to_from = tf.keras.layers.Lambda(lambda x: x, name="umap")(
+            viz_to_from
+        )
+        outputs = {'umap': viz_to_from}
+        return outputs
+
+
+
 class CustomParametricUMAP:
-    def __init__(self, raw_data, data_for_neighbor_graph):
+    def __init__(self, raw_data, data_for_neighbor_graph, bert_model):
         self.raw_data = raw_data
         self.data_for_neighbor_graph = data_for_neighbor_graph
+        self.bert_model = bert_model
         self.n_neighbors = 10
         self.metric = "cosine"
-
+        
     def get_neighbor_graph(self):
         X = self.data_for_neighbor_graph
         # number of trees in random projection forest
@@ -134,17 +161,47 @@ class CustomParametricUMAP:
             tail,
             edge_weight,
         ) = construct_edge_dataset(
-            self.data_for_neighbor_graph,
+            self.raw_data,
             umap_graph,
             n_epochs,
             batch_size,
             parametric_embedding=True,
             parametric_reconstruction=False,
+            global_correlation_loss_weight=0
         )
-        print
+        return edge_dataset, n_edges
 
     def fit_transform(self):
-        self.get_edge_dataset()
+        edge_dataset, n_edges = self.get_edge_dataset()
+        parametric_model = UMAPExtender(self.bert_model)
+        # create model
+        optimizer = tf.keras.optimizers.Adam(1e-3)
+        _a = 1
+        _b = 1
+        batch_size = 32
+        negative_sample_rate = 5
+        edge_weight = 1
+        umap_loss_fn = umap_loss(
+            batch_size,
+            negative_sample_rate,
+            _a,
+            _b,
+            edge_weight,
+            parametric_embedding = True
+        )
+        parametric_model.compile(
+           optimizer=optimizer, loss=umap_loss_fn, run_eagerly=True
+        )
+        # parametric_model(next(iter(edge_dataset.take(1))))
+        steps_per_epoch = int(
+           n_edges / batch_size / 5
+        )
+        history = parametric_model.fit(
+            edge_dataset,
+            epochs=20,
+            steps_per_epoch=steps_per_epoch,
+            max_queue_size=100,
+        )
 
 
 def preprocess_data_df(df, sampling_ratio=1):
@@ -203,6 +260,10 @@ class TextEmbedder:
             model.layers[2].trainable = False
             self.classification_model = model
             return model
+
+    def get_model(self, model_name, mode):
+        self.model = E2ESentenceTransformer(model_name, mode=mode)
+        return self.model
 
     def get_data(self):
         if self.dataset is not None:
@@ -301,14 +362,12 @@ class TextEmbedder:
                 self.data_df.long_description.values)
             labels = self.data_df.category.values
         elif representation_class == 'bert':
-            model = E2ESentenceTransformer(
-                'bert-base-cased', mode=representation_method.split('_')[1])
+            model = self.get_model('bert-base-cased', mode=representation_method.split('_')[1])
             representations = model.predict(
                 self.data_df.long_description.values.tolist(), batch_size=32)
             labels = self.data_df.category.values
         elif representation_class == 'sbert':
-            model = E2ESentenceTransformer(
-                'sentence-transformers/all-MiniLM-L6-v2', mode=representation_method.split('_')[1])
+            model = self.get_model('sentence-transformers/all-MiniLM-L6-v2', mode=representation_method.split('_')[1])
             representations = model.predict(
                 self.data_df.long_description.values.tolist(), batch_size=32)
             labels = self.data_df.category.values
@@ -329,7 +388,8 @@ class TextEmbedder:
                 reducer = umap.parametric_umap.ParametricUMAP()
             elif '_customparametric' in representation_method:
                 reducer = CustomParametricUMAP(raw_data=self.data_df.long_description.values,
-                                               data_for_neighbor_graph=representations)
+                                               data_for_neighbor_graph=representations,
+                                               bert_model=self.model)
                 embedding = reducer.fit_transform()
             else:
                 reducer = umap.UMAP(metric='cosine')
