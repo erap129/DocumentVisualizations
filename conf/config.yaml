@@ -1,0 +1,12 @@
+seq_len: 50
+representation_methods: [sbert, bert_average, bert_cls, tfidf]
+dataset: "news"
+batch_size: 32
+task: visualize_embeddings
+random_seed: 42
+validation_set_size: 0.2
+dataset_shuffle_size: 10000
+dataset_dir: ~/Code/ParametricUMAP/data
+n_classes: 42
+data_sampling_ratio: 1
+bert_model_name: "bert-base-cased"
