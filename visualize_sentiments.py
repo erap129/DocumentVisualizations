@@ -25,10 +25,16 @@ import plotly.express as px
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 from pynndescent import NNDescent
-from umap.umap_ import fuzzy_simplicial_set
+from umap.umap_ import fuzzy_simplicial_set, find_ab_params
 from sklearn.utils import check_random_state
 from umap.parametric_umap import construct_edge_dataset
-from umap.parametric_umap import umap_loss 
+from umap.parametric_umap import umap_loss
+
+
+HF_MODEL_NAMES = {'bert': 'bert-base-cased',
+                  'sbert': 'sentence-transformers/all-MiniLM-L6-v2',
+                  'simcse': 'princeton-nlp/sup-simcse-bert-base-uncased',
+                  'bertmini': 'google/bert_uncased_L-4_H-256_A-4'}
 
 
 def mean_pooling(model_output, attention_mask):
@@ -47,7 +53,12 @@ class TFSentenceTransformer(tf.keras.layers.Layer):
         super(TFSentenceTransformer, self).__init__()
         # loads transformers model
         self.mode = mode
-        self.model = TFAutoModel.from_pretrained(model_name_or_path, **kwargs)
+        try:
+            self.model = TFAutoModel.from_pretrained(
+                model_name_or_path, **kwargs)
+        except OSError:
+            self.model = TFAutoModel.from_pretrained(
+                model_name_or_path, from_pt=True, **kwargs)
 
     def call(self, inputs, normalize=True):
         # runs model on inputs
@@ -73,8 +84,12 @@ class E2ESentenceTransformer(tf.keras.Model):
     def __init__(self, model_name_or_path, mode, **kwargs):
         super().__init__()
         # loads the in-graph tokenizer
-        self.tokenizer = TFBertTokenizer.from_pretrained(
-            model_name_or_path, **kwargs)
+        try:
+            self.tokenizer = TFBertTokenizer.from_pretrained(
+                model_name_or_path, **kwargs)
+        except OSError:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name_or_path, **kwargs)
         # loads our TFSentenceTransformer
         self.model = TFSentenceTransformer(model_name_or_path, mode, **kwargs)
 
@@ -108,15 +123,28 @@ class UMAPExtender(tf.keras.Model):
         return outputs
 
 
+class UMAPNormalModel(tf.keras.Model):
+    def __init__(self, encoder, dense_layer):
+        super().__init__()
+        self.encoder = encoder
+        self.dense = dense_layer
+
+    def call(self, inputs):
+        embedding = self.encoder(inputs)
+        viz = self.dense(embedding)
+        return viz
+
 
 class CustomParametricUMAP:
-    def __init__(self, raw_data, data_for_neighbor_graph, bert_model):
+    def __init__(self, raw_data, data_for_neighbor_graph, bert_model, batch_size=32, n_epochs=1):
         self.raw_data = raw_data
         self.data_for_neighbor_graph = data_for_neighbor_graph
         self.bert_model = bert_model
         self.n_neighbors = 10
         self.metric = "cosine"
-        
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+
     def get_neighbor_graph(self):
         X = self.data_for_neighbor_graph
         # number of trees in random projection forest
@@ -151,8 +179,7 @@ class CustomParametricUMAP:
 
     def get_edge_dataset(self):
         umap_graph = self.get_fuzzy_simplicial_set()
-        n_epochs = 200
-        batch_size = 128
+        n_epochs = self.n_epochs
         (
             edge_dataset,
             batch_size,
@@ -164,44 +191,44 @@ class CustomParametricUMAP:
             self.raw_data,
             umap_graph,
             n_epochs,
-            batch_size,
+            self.batch_size,
             parametric_embedding=True,
             parametric_reconstruction=False,
             global_correlation_loss_weight=0
         )
-        return edge_dataset, n_edges
+        return edge_dataset, n_edges, edge_weight
 
-    def fit_transform(self):
-        edge_dataset, n_edges = self.get_edge_dataset()
+    def fit_transform(self, X):
+        edge_dataset, n_edges, edge_weight = self.get_edge_dataset()
         parametric_model = UMAPExtender(self.bert_model)
         # create model
         optimizer = tf.keras.optimizers.Adam(1e-3)
-        _a = 1
-        _b = 1
-        batch_size = 32
+        min_dist = 0.1
+        _a, _b = find_ab_params(1.0, min_dist)
         negative_sample_rate = 5
-        edge_weight = 1
         umap_loss_fn = umap_loss(
-            batch_size,
+            self.batch_size,
             negative_sample_rate,
             _a,
             _b,
             edge_weight,
-            parametric_embedding = True
+            parametric_embedding=True
         )
         parametric_model.compile(
-           optimizer=optimizer, loss=umap_loss_fn, run_eagerly=True
+            optimizer=optimizer, loss=umap_loss_fn, run_eagerly=True
         )
-        # parametric_model(next(iter(edge_dataset.take(1))))
         steps_per_epoch = int(
-           n_edges / batch_size / 5
+            n_edges / self.batch_size / 5
         )
         history = parametric_model.fit(
             edge_dataset,
-            epochs=20,
+            epochs=self.n_epochs,
             steps_per_epoch=steps_per_epoch,
             max_queue_size=100,
         )
+        normal_model = UMAPNormalModel(
+            parametric_model.encoder, parametric_model.dense)
+        return normal_model.predict(X)
 
 
 def preprocess_data_df(df, sampling_ratio=1):
@@ -361,13 +388,10 @@ class TextEmbedder:
             representations = tfidf_vectorizer.fit_transform(
                 self.data_df.long_description.values)
             labels = self.data_df.category.values
-        elif representation_class == 'bert':
-            model = self.get_model('bert-base-cased', mode=representation_method.split('_')[1])
-            representations = model.predict(
-                self.data_df.long_description.values.tolist(), batch_size=32)
-            labels = self.data_df.category.values
-        elif representation_class == 'sbert':
-            model = self.get_model('sentence-transformers/all-MiniLM-L6-v2', mode=representation_method.split('_')[1])
+        elif representation_class in list(HF_MODEL_NAMES.keys()):
+            model_name = HF_MODEL_NAMES[representation_class]
+            model = self.get_model(
+                model_name, mode=representation_method.split('_')[1])
             representations = model.predict(
                 self.data_df.long_description.values.tolist(), batch_size=32)
             labels = self.data_df.category.values
@@ -386,14 +410,16 @@ class TextEmbedder:
                 representation_method)
             if '_parametric' in representation_method:
                 reducer = umap.parametric_umap.ParametricUMAP()
+                embedding = reducer.fit_transform(representations)
             elif '_customparametric' in representation_method:
                 reducer = CustomParametricUMAP(raw_data=self.data_df.long_description.values,
                                                data_for_neighbor_graph=representations,
                                                bert_model=self.model)
-                embedding = reducer.fit_transform()
+                embedding = reducer.fit_transform(
+                    self.data_df.long_description.values)
             else:
                 reducer = umap.UMAP(metric='cosine')
-            embedding = reducer.fit_transform(representations)
+                embedding = reducer.fit_transform(representations)
             fig = px.scatter(x=embedding[:, 0],
                              y=embedding[:, 1], color=labels)
             viz_filename = f'{representation_method}_embedding_viz.html'
@@ -423,7 +449,7 @@ def calculate_distance_consistency(viz_result):
     centroids = viz_df.groupby('labels').mean()
     viz_df_with_closest_centroids = viz_df.assign(closest_centroid=viz_df.apply(
         lambda row: get_closest_centroid(row, centroids), axis=1),
-        correct_closest_centroid=lambda df: df.closest_centroid == df.labels)
+        correct_closest_centroid=lambda df: df.closest_centroid != df.labels)
     return viz_df_with_closest_centroids.correct_closest_centroid.sum() / len(viz_df_with_closest_centroids)
 
 
